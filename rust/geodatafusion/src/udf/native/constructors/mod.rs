@@ -1,5 +1,7 @@
+mod collect;
 mod point;
 
+pub use collect::CollectAggregate;
 pub use point::{MakePoint, MakePointM, Point, PointM, PointZ, PointZM};
 
 pub fn register(session_context: &datafusion::prelude::SessionContext) {
@@ -9,4 +11,5 @@ pub fn register(session_context: &datafusion::prelude::SessionContext) {
     session_context.register_udf(PointM::default().into());
     session_context.register_udf(PointZ::default().into());
     session_context.register_udf(PointZM::default().into());
+    session_context.register_udaf(CollectAggregate::default().into());
 }
