@@ -2,10 +2,9 @@ use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, BooleanArray, ListArray, UInt32Array, new_empty_array};
+use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_buffer::{NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, Field, FieldRef};
-use datafusion::arrow::compute::{concat, interleave, take};
+use arrow_schema::{DataType, FieldRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::scalar_doc_sections::DOC_SECTION_OTHER;
@@ -13,147 +12,34 @@ use datafusion::logical_expr::{
     Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator, Signature,
 };
 use datafusion::scalar::ScalarValue;
-use geoarrow_array::GeoArrowArray;
-use geoarrow_array::array::from_arrow_array;
-use geoarrow_array::builder::WkbBuilder;
-use geoarrow_array::cast::{from_wkb, to_wkb};
-use geoarrow_schema::{CoordType, GeoArrowType, GeometryType, Metadata, WkbType};
+use geoarrow_schema::{CoordType, GeometryType, Metadata};
+
+mod container;
+mod output;
+mod state;
+
+use output::assemble_output;
+use state::{
+    MemberBatches, StateEncoding, compact_retained_batches, decode_state_values,
+    filter_to_null_buffer, normalize_input_for_encoding, state_list_array,
+};
 
 use crate::data_types::any_single_geometry_type_input;
 use crate::error::GeoDataFusionResult;
-
-// TODO: Do we really need this sort of hand-rolled WKB? If so, can we put it in its own module?
-// TODO: Does this / should this work with native arrow geometries?
-
-/// WKB byte-order marker for little-endian (NDR) encoding — the encoding geoarrow's `to_wkb` emits.
-const WKB_NDR: u8 = 1;
-
-// ISO-WKB type codes are `base + dimension_offset`. The dimension offset is 0 (XY), 1000 (XYZ),
-// 2000 (XYM), or 3000 (XYZM); the base identifies the kind: Point=1, LineString=2, Polygon=3,
-// MultiPoint=4, MultiLineString=5, MultiPolygon=6, GeometryCollection=7. The MULTI* of an atomic
-// base is therefore `base + ATOMIC_TO_MULTI`.
-const DIM_MODULUS: u32 = 1000;
-const MAX_ATOMIC_BASE: u32 = 3;
-const ATOMIC_TO_MULTI: u32 = 3;
-const GEOMETRY_COLLECTION_BASE: u32 = 7;
-
-/// Read a WKB geometry's ISO type code (`base + dimension_offset`).
-///
-/// `wkb` is always a valid ISO-WKB blob (≥5 bytes) produced by geoarrow's `to_wkb`, so the slicing
-/// below cannot panic in practice.
-fn member_type_code(wkb: &[u8]) -> u32 {
-    let code: [u8; 4] = wkb[1..5]
-        .try_into()
-        .expect("WKB header has a 4-byte type code");
-    if wkb[0] == WKB_NDR {
-        u32::from_le_bytes(code)
-    } else {
-        u32::from_be_bytes(code)
-    }
-}
-
-/// Assemble a single MULTI*/GEOMETRYCOLLECTION as ISO-WKB from member WKBs.
-///
-/// Per PostGIS `ST_Collect`: homogeneous atomic members (all Point, all LineString, or all Polygon)
-/// yield the matching `MULTI*`; mixed base types, or members that are themselves multis/collections,
-/// yield a `GEOMETRYCOLLECTION`. Members are embedded verbatim (no dedup or dissolve), so Z/M are
-/// preserved.
-///
-/// All members must share one coordinate dimension. geoarrow's `Geometry` type stores each
-/// collection element under a single dimension, so mixing dimensions (e.g. XY with XYZ) is
-/// unrepresentable and returns an error rather than panicking in the downstream array builder.
-///
-/// `members` must be non-empty.
-fn build_container_wkb(members: &[&[u8]]) -> GeoDataFusionResult<Vec<u8>> {
-    let code0 = member_type_code(members[0]);
-    let (base0, dim0) = (code0 % DIM_MODULUS, code0 - code0 % DIM_MODULUS);
-
-    if members.iter().any(|m| {
-        let code = member_type_code(m);
-        code - code % DIM_MODULUS != dim0
-    }) {
-        return Err(DataFusionError::NotImplemented(
-            "ST_Collect cannot combine geometries of differing coordinate dimensions (e.g. XY and \
-             XYZ)"
-                .to_string(),
-        )
-        .into());
-    }
-
-    // Dimensions are now known uniform, so homogeneity reduces to a shared atomic base type.
-    let homogeneous_atomic = (1..=MAX_ATOMIC_BASE).contains(&base0)
-        && members
-            .iter()
-            .all(|m| member_type_code(m) % DIM_MODULUS == base0);
-
-    let container_base = if homogeneous_atomic {
-        base0 + ATOMIC_TO_MULTI
-    } else {
-        GEOMETRY_COLLECTION_BASE
-    };
-    let container_code = container_base + dim0;
-
-    let total: usize = members.iter().map(|m| m.len()).sum();
-    // Header is the endianness byte + u32 type code + u32 member count.
-    let mut buf = Vec::with_capacity(9 + total);
-    buf.push(WKB_NDR);
-    buf.extend_from_slice(&container_code.to_le_bytes());
-    buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
-    for m in members {
-        buf.extend_from_slice(m);
-    }
-    Ok(buf)
-}
-
-/// Encode an input geometry array to its WKB bytes as a contiguous Arrow `BinaryArray`.
-///
-/// This is the one allocation per input batch: geoarrow packs every geometry's WKB into a single
-/// Arrow buffer with offsets, so members can later be referenced as zero-copy `&[u8]` slices (via
-/// `BinaryArray::value`) rather than copied out one `Vec` at a time.
-fn geom_to_wkb_binary(values: &ArrayRef, input_field: &FieldRef) -> GeoDataFusionResult<ArrayRef> {
-    let geo = from_arrow_array(values, input_field)?;
-    let wkb = to_wkb::<i32>(geo.as_ref())?;
-    // Cheap: `GenericBinaryArray` clone shares the underlying (Arc-backed) Arrow buffers.
-    Ok(Arc::new(wkb.inner().clone()))
-}
-
-/// Assemble the mixed-`Geometry` output array from one container WKB per output row.
-///
-/// `containers` yields one entry per row in group order — `Some(wkb)` for a non-empty group, `None`
-/// for an empty/all-NULL group (rendered as a NULL geometry). Every container goes into a single
-/// `WkbArray`, so the (comparatively expensive) WKB→`Geometry` parse runs exactly once for the whole
-/// output instead of once per group.
-fn build_geometry_array(
-    containers: impl IntoIterator<Item = Option<Vec<u8>>>,
-    metadata: Arc<Metadata>,
-    coord_type: CoordType,
-) -> GeoDataFusionResult<ArrayRef> {
-    let geom_type = GeometryType::new(metadata.clone()).with_coord_type(coord_type);
-    let mut builder = WkbBuilder::<i32>::new(WkbType::new(metadata));
-    for container in containers {
-        builder.push_wkb(container.as_deref())?;
-    }
-    let wkb = builder.finish();
-    let out = from_wkb(&wkb, GeoArrowType::Geometry(geom_type))?;
-    Ok(out.to_array_ref())
-}
-
-/// Convert a selection filter into a `NullBuffer` marking filtered-out rows (value `false`, or a NULL
-/// filter slot) as null — used to drop those rows from `convert_to_state` output.
-fn filter_to_null_buffer(filter: &BooleanArray) -> Option<NullBuffer> {
-    let (keep, filter_nulls) = filter.clone().into_parts();
-    NullBuffer::union(Some(&NullBuffer::new(keep)), filter_nulls.as_ref())
-}
 
 /// `ST_Collect` aggregate: collects a set of geometries into one MULTI*/GEOMETRYCOLLECTION.
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct CollectAggregate {
     coord_type: CoordType,
+    aliases: Vec<String>,
 }
 
 impl CollectAggregate {
     pub fn new(coord_type: CoordType) -> Self {
-        Self { coord_type }
+        Self {
+            coord_type,
+            aliases: vec!["st_collect_agg".to_string()],
+        }
     }
 }
 
@@ -170,9 +56,12 @@ impl AggregateUDFImpl for CollectAggregate {
         self
     }
 
-    // TODO: ST_CollectAgg?
     fn name(&self) -> &str {
-        "st_collect"
+        "st_collectagg"
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 
     fn signature(&self) -> &Signature {
@@ -193,19 +82,44 @@ impl AggregateUDFImpl for CollectAggregate {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        // The partial state is the accumulated member geometries, serialized as a list of WKB blobs.
-        Ok(vec![Arc::new(Field::new(
-            format!("{}[wkbs]", args.name),
-            DataType::List(Arc::new(Field::new_list_field(DataType::Binary, true))),
-            true,
-        ))])
+        if args.is_distinct {
+            return Err(DataFusionError::NotImplemented(
+                "ST_CollectAgg does not support DISTINCT yet".to_string(),
+            ));
+        }
+        if !args.ordering_fields.is_empty() {
+            return Err(DataFusionError::NotImplemented(
+                "ST_CollectAgg does not support aggregate ORDER BY yet".to_string(),
+            ));
+        }
+
+        let input_field = args.input_fields[0].as_ref();
+        let metadata = Arc::new(Metadata::try_from(input_field).unwrap_or_default());
+        let encoding = StateEncoding::for_field(input_field)?;
+        Ok(vec![encoding.state_field(
+            args.name,
+            &metadata,
+            self.coord_type,
+        )])
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        if acc_args.is_distinct {
+            return Err(DataFusionError::NotImplemented(
+                "ST_CollectAgg does not support DISTINCT yet".to_string(),
+            ));
+        }
+        if !acc_args.order_bys.is_empty() {
+            return Err(DataFusionError::NotImplemented(
+                "ST_CollectAgg does not support aggregate ORDER BY yet".to_string(),
+            ));
+        }
+
         let input_field = acc_args.exprs[0].return_field(acc_args.schema)?;
         let metadata = Arc::new(Metadata::try_from(input_field.as_ref()).unwrap_or_default());
+        let encoding = StateEncoding::for_field(input_field.as_ref())?;
         Ok(Box::new(CollectAccumulator {
-            batches: Vec::new(),
+            batches: MemberBatches::new(encoding),
             input_field,
             metadata,
             coord_type: self.coord_type,
@@ -213,9 +127,10 @@ impl AggregateUDFImpl for CollectAggregate {
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
-        // Use the vectorized `GroupsAccumulator` for plain `GROUP BY`. DISTINCT and ORDER BY have no
-        // defined meaning for `ST_Collect` and fall back to the simple `Accumulator`, preserving today's
-        // (non-deduping, order-insensitive) behavior.
+        // TODO: Support for distinct and order by.
+        // These are not implemented yet, but it seems possible that we might in the future.
+        // It's not yet decided if we would implement these as simple or groups accumulators.
+        // This condition is simply a defensive contract that we can amend later.
         !args.is_distinct && args.order_bys.is_empty()
     }
 
@@ -223,12 +138,25 @@ impl AggregateUDFImpl for CollectAggregate {
         &self,
         acc_args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
+        if acc_args.is_distinct {
+            return Err(DataFusionError::NotImplemented(
+                "ST_CollectAgg does not support DISTINCT yet".to_string(),
+            ));
+        }
+        if !acc_args.order_bys.is_empty() {
+            return Err(DataFusionError::NotImplemented(
+                "ST_CollectAgg does not support aggregate ORDER BY yet".to_string(),
+            ));
+        }
+
         let input_field = acc_args.exprs[0].return_field(acc_args.schema)?;
         let metadata = Arc::new(Metadata::try_from(input_field.as_ref()).unwrap_or_default());
+        let encoding = StateEncoding::for_field(input_field.as_ref())?;
         Ok(Box::new(CollectGroupsAccumulator::new(
             input_field,
             metadata,
             self.coord_type,
+            encoding,
         )))
     }
 
@@ -241,9 +169,8 @@ impl AggregateUDFImpl for CollectAggregate {
                  Returns a MULTI* if all inputs share a single atomic type (Point/LineString/Polygon), otherwise a GEOMETRYCOLLECTION. \
                  NULL inputs are skipped; an all-NULL or empty group yields NULL.
                  Z and M are preserved, but all inputs must be of the same coordinate dimension
-                 (mixing e.g. XY and XYZ is an error). \
-                 This is the inverse of ST_Dump.",
-                "ST_Collect(geom)",
+                 (mixing e.g. XY and XYZ is an error).",
+                "ST_Collect_Agg(geom)",
             )
             .with_argument("geom", "geometry")
             .build()
@@ -251,11 +178,10 @@ impl AggregateUDFImpl for CollectAggregate {
     }
 }
 
+/// Simple accumulator.
 #[derive(Debug)]
 struct CollectAccumulator {
-    /// Accumulated WKB members held as contiguous Arrow `BinaryArray` buffers — one per `update`/
-    /// `merge` batch — and referenced by slice at evaluate time, so no individual geometry is copied.
-    batches: Vec<ArrayRef>,
+    batches: MemberBatches,
     input_field: FieldRef,
     metadata: Arc<Metadata>,
     coord_type: CoordType,
@@ -263,23 +189,24 @@ struct CollectAccumulator {
 
 impl CollectAccumulator {
     fn update_inner(&mut self, values: &[ArrayRef]) -> GeoDataFusionResult<()> {
-        self.batches
-            .push(geom_to_wkb_binary(&values[0], &self.input_field)?);
+        let batch = normalize_input_for_encoding(
+            self.batches.encoding(),
+            &values[0],
+            &self.input_field,
+            &self.metadata,
+            self.coord_type,
+        )?;
+        self.batches.push(batch)?;
         Ok(())
     }
 
     fn evaluate_inner(&self) -> GeoDataFusionResult<ScalarValue> {
-        let mut members: Vec<&[u8]> = Vec::new();
-        for batch in &self.batches {
-            members.extend(batch.as_binary::<i32>().iter().flatten());
-        }
-        let container = if members.is_empty() {
-            None
-        } else {
-            Some(build_container_wkb(&members)?)
-        };
-        let arr = build_geometry_array(
-            std::iter::once(container),
+        // One group spanning every non-NULL row across all batches.
+        let entries = self.batches.non_null_order();
+        let groups: [&[(usize, usize)]; 1] = [entries.as_slice()];
+        let arr = assemble_output(
+            &self.batches,
+            &groups,
             self.metadata.clone(),
             self.coord_type,
         )?;
@@ -296,63 +223,77 @@ impl Accumulator for CollectAccumulator {
         Ok(self.evaluate_inner()?)
     }
 
-    /// Partial state is the members as a single-row `List<Binary>`. The member buffers are
-    /// concatenated once (sharing the input data) rather than re-cloned blob-by-blob.
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let values: ArrayRef = if self.batches.is_empty() {
-            new_empty_array(&DataType::Binary)
-        } else {
-            let refs: Vec<&dyn Array> = self.batches.iter().map(|b| b.as_ref()).collect();
-            concat(&refs)?
-        };
+        let order = self.batches.non_null_order();
+        let values =
+            self.batches
+                .state_values(Some(order.as_slice()), &self.metadata, self.coord_type)?;
         let offsets = OffsetBuffer::<i32>::from_lengths([values.len()]);
-        let field = Arc::new(Field::new_list_field(DataType::Binary, true));
-        let list = ListArray::new(field, offsets, values, None);
+        // An all-NULL/empty group has no members: emit a NULL list row (matching the groups path)
+        // instead of a non-null empty list, so the two partial-state shapes agree.
+        let nulls = order.is_empty().then(|| NullBuffer::new_null(1));
+        let list = state_list_array(
+            self.batches.encoding(),
+            offsets,
+            values,
+            nulls,
+            &self.metadata,
+            self.coord_type,
+        );
         Ok(vec![ScalarValue::List(Arc::new(list))])
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        // Each non-NULL list row contributes its backing `BinaryArray` slice as a batch; NULL members
-        // within are skipped when slices are gathered at evaluate time.
+        // Each non-NULL list row carries member values in the accumulator's state encoding.
         for inner in states[0].as_list::<i32>().iter().flatten() {
-            self.batches.push(inner);
+            let batch = decode_state_values(
+                self.batches.encoding(),
+                &inner,
+                &self.metadata,
+                self.coord_type,
+            )?;
+            self.batches.push(batch)?;
         }
         Ok(())
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.batches.capacity() * std::mem::size_of::<ArrayRef>()
-            + self
-                .batches
-                .iter()
-                .map(|b| b.get_array_memory_size())
-                .sum::<usize>()
+        std::mem::size_of_val(self) + self.batches.memory_size()
     }
 }
 
-/// Vectorized `GroupsAccumulator` for more efficient high-cardinality grouped aggregates.
+type Entry = (u32, u32);
+
+/// `GroupsAccumulator` for more efficient high-cardinality grouped aggregates.
 #[derive(Debug)]
 struct CollectGroupsAccumulator {
     input_field: FieldRef,
     metadata: Arc<Metadata>,
     coord_type: CoordType,
-    /// WKB source arrays — input geometries (from `update_batch`) or list-backing values (from
-    /// `merge_batch`) — all `BinaryArray`s referenced by `batch_entries`.
-    batches: Vec<ArrayRef>,
+    /// Member source arrays referenced by `batch_entries`, fixed to either WKB or native Geometry
+    /// state for the lifetime of this accumulator.
+    batches: MemberBatches,
     /// Per-batch `(group_idx, row_idx)` pairs for rows that survived filtering and were non-NULL.
-    batch_entries: Vec<Vec<(u32, u32)>>,
+    batch_entries: Vec<Vec<Entry>>,
+    /// Running sum of the heap capacity of every inner `batch_entries` vector.
+    entries_bytes: usize,
     num_groups: usize,
 }
 
 impl CollectGroupsAccumulator {
-    fn new(input_field: FieldRef, metadata: Arc<Metadata>, coord_type: CoordType) -> Self {
+    fn new(
+        input_field: FieldRef,
+        metadata: Arc<Metadata>,
+        coord_type: CoordType,
+        encoding: StateEncoding,
+    ) -> Self {
         Self {
             input_field,
             metadata,
             coord_type,
-            batches: Vec::new(),
+            batches: MemberBatches::new(encoding),
             batch_entries: Vec::new(),
+            entries_bytes: 0,
             num_groups: 0,
         }
     }
@@ -397,51 +338,23 @@ impl CollectGroupsAccumulator {
             EmitTo::All => {
                 self.batches.clear();
                 self.batch_entries.clear();
+                self.entries_bytes = 0;
                 self.num_groups = 0;
             }
-            EmitTo::First(n) => self.compact_retained_state(n)?,
+            EmitTo::First(n) => {
+                // Retained groups are renumbered to start at zero, matching DataFusion's contract
+                // that subsequent group indices are shifted down by the emitted prefix length.
+                // Compaction rebuilds `batch_entries` in place and returns its refreshed footprint.
+                self.entries_bytes = compact_retained_batches(
+                    &mut self.batches,
+                    &mut self.batch_entries,
+                    n,
+                    &self.metadata,
+                    self.coord_type,
+                )?;
+                self.num_groups -= n;
+            }
         }
-        Ok(())
-    }
-
-    /// Rebuild state retaining only groups `>= emit_groups` (renumbered to start at 0), used by
-    /// `EmitTo::First` under memory pressure. Fully-emitted batches are dropped and mixed batches are
-    /// compacted via `take` so retained rows no longer pin whole input arrays. Ported from `array_agg`.
-    fn compact_retained_state(&mut self, emit_groups: usize) -> Result<()> {
-        let emit_groups = emit_groups as u32;
-        let old_batches = std::mem::take(&mut self.batches);
-        let old_batch_entries = std::mem::take(&mut self.batch_entries);
-        for (batch, entries) in old_batches.into_iter().zip(old_batch_entries) {
-            let retained_len = entries.iter().filter(|(g, _)| *g >= emit_groups).count();
-            if retained_len == 0 {
-                continue;
-            }
-            if retained_len == entries.len() {
-                let mut retained_entries = entries;
-                for (g, _) in &mut retained_entries {
-                    *g -= emit_groups;
-                }
-                self.batches.push(batch);
-                self.batch_entries.push(retained_entries);
-                continue;
-            }
-            let mut retained_entries = Vec::with_capacity(retained_len);
-            let mut retained_rows = Vec::with_capacity(retained_len);
-            for (g, r) in entries {
-                if g >= emit_groups {
-                    retained_entries.push((g - emit_groups, retained_rows.len() as u32));
-                    retained_rows.push(r);
-                }
-            }
-            let batch = if retained_len == batch.len() {
-                batch
-            } else {
-                take(batch.as_ref(), &UInt32Array::from(retained_rows), None)?
-            };
-            self.batches.push(batch);
-            self.batch_entries.push(retained_entries);
-        }
-        self.num_groups -= emit_groups as usize;
         Ok(())
     }
 }
@@ -454,7 +367,14 @@ impl GroupsAccumulator for CollectGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        let wkb = geom_to_wkb_binary(&values[0], &self.input_field)?;
+        // Normalize the input batch once, then retain only `(group,row)` references for retained members.
+        let batch = normalize_input_for_encoding(
+            self.batches.encoding(),
+            &values[0],
+            &self.input_field,
+            &self.metadata,
+            self.coord_type,
+        )?;
         self.num_groups = self.num_groups.max(total_num_groups);
         let mut entries = Vec::new();
         for (row, &group) in group_indices.iter().enumerate() {
@@ -464,13 +384,14 @@ impl GroupsAccumulator for CollectGroupsAccumulator {
                 continue;
             }
             // NULL geometries contribute nothing (matches ST_Collect semantics).
-            if wkb.is_null(row) {
+            if batch.is_null(row) {
                 continue;
             }
             entries.push((group as u32, row as u32));
         }
         if !entries.is_empty() {
-            self.batches.push(wkb);
+            self.batches.push(batch)?;
+            self.entries_bytes += entries.capacity() * std::mem::size_of::<Entry>();
             self.batch_entries.push(entries);
         }
         Ok(())
@@ -482,38 +403,31 @@ impl GroupsAccumulator for CollectGroupsAccumulator {
             EmitTo::First(n) => n,
         };
         let (offsets, order) = self.group_order(emit_groups);
-        let mut members: Vec<&[u8]> = Vec::new();
-        let mut containers: Vec<Option<Vec<u8>>> = Vec::with_capacity(emit_groups);
-        for g in 0..emit_groups {
-            let (start, end) = (offsets[g] as usize, offsets[g + 1] as usize);
-            if start == end {
-                containers.push(None);
-                continue;
-            }
-            members.clear();
-            for &(bi, ri) in &order[start..end] {
-                members.push(self.batches[bi].as_binary::<i32>().value(ri));
-            }
-            containers.push(Some(build_container_wkb(&members)?));
-        }
-        let array = build_geometry_array(containers, self.metadata.clone(), self.coord_type)?;
+        let groups: Vec<&[(usize, usize)]> = (0..emit_groups)
+            .map(|g| &order[offsets[g] as usize..offsets[g + 1] as usize])
+            .collect();
+        let array = assemble_output(
+            &self.batches,
+            &groups,
+            self.metadata.clone(),
+            self.coord_type,
+        )?;
         self.reset_after_emit(emit_to)?;
         Ok(array)
     }
 
-    /// Partial state: a `List<Binary>` with one list of WKB members per group, in group order.
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        // Partial state is one list of members per group, in group-index order.
         let emit_groups = match emit_to {
             EmitTo::All => self.num_groups,
             EmitTo::First(n) => n,
         };
         let (offsets, order) = self.group_order(emit_groups);
-        let values: ArrayRef = if order.is_empty() {
-            new_empty_array(&DataType::Binary)
-        } else {
-            let sources: Vec<&dyn Array> = self.batches.iter().map(|b| b.as_ref()).collect();
-            interleave(&sources, &order)?
-        };
+        let values = self.batches.state_values(
+            (!order.is_empty()).then_some(order.as_slice()),
+            &self.metadata,
+            self.coord_type,
+        )?;
         let mut nulls = NullBufferBuilder::new(emit_groups);
         for g in 0..emit_groups {
             if offsets[g] == offsets[g + 1] {
@@ -523,8 +437,14 @@ impl GroupsAccumulator for CollectGroupsAccumulator {
             }
         }
         let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
-        let field = Arc::new(Field::new_list_field(DataType::Binary, true));
-        let list = ListArray::new(field, offsets, values, nulls.finish());
+        let list = state_list_array(
+            self.batches.encoding(),
+            offsets,
+            values,
+            nulls.finish(),
+            &self.metadata,
+            self.coord_type,
+        );
         self.reset_after_emit(emit_to)?;
         Ok(vec![Arc::new(list)])
     }
@@ -551,27 +471,52 @@ impl GroupsAccumulator for CollectGroupsAccumulator {
             }
         }
         if !entries.is_empty() {
-            self.batches.push(Arc::clone(list.values()));
+            let batch = decode_state_values(
+                self.batches.encoding(),
+                list.values(),
+                &self.metadata,
+                self.coord_type,
+            )?;
+            self.batches.push(batch)?;
+            self.entries_bytes += entries.capacity() * std::mem::size_of::<Entry>();
             self.batch_entries.push(entries);
         }
         Ok(())
     }
 
-    /// Treat each input row as its own group: emit a `List<Binary>` whose i-th list holds just row i's
-    /// WKB (or NULL when filtered out or NULL). DataFusion uses this to bypass the group hash table
-    /// when cardinality approaches the row count — the common case here.
     fn convert_to_state(
         &self,
         values: &[ArrayRef],
         opt_filter: Option<&BooleanArray>,
     ) -> Result<Vec<ArrayRef>> {
-        let wkb = geom_to_wkb_binary(&values[0], &self.input_field)?;
-        let len = wkb.len();
+        // Converts to a regular state (DataFusion calls this when the cardinality gets too high).
+        // Treats each input row as its own group and emit a one-element list
+        // using the selected state encoding, or NULL when filtered out or NULL.
+        let batch = normalize_input_for_encoding(
+            self.batches.encoding(),
+            &values[0],
+            &self.input_field,
+            &self.metadata,
+            self.coord_type,
+        )?;
+        let len = batch.len();
+        let members = batch.to_array_ref();
+        // One length-1 run per row (offsets [0,1,…,len]): list row i wraps member i.
         let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::repeat_n(1usize, len));
+        // A list row is non-NULL only where the row passed the filter AND its geometry is non-NULL;
+        // otherwise it is a NULL entry that merge_batch skips. NullBuffer::union keeps a row valid
+        // only where both inputs are valid.
         let filter_nulls = opt_filter.and_then(filter_to_null_buffer);
-        let nulls = NullBuffer::union(filter_nulls.as_ref(), wkb.nulls());
-        let field = Arc::new(Field::new_list_field(DataType::Binary, true));
-        let list = ListArray::new(field, offsets, wkb, nulls);
+        let geometry_nulls = batch.logical_nulls();
+        let list_nulls = NullBuffer::union(filter_nulls.as_ref(), geometry_nulls.as_ref());
+        let list = state_list_array(
+            self.batches.encoding(),
+            offsets,
+            members,
+            list_nulls,
+            &self.metadata,
+            self.coord_type,
+        );
         Ok(vec![Arc::new(list)])
     }
 
@@ -581,16 +526,9 @@ impl GroupsAccumulator for CollectGroupsAccumulator {
 
     fn size(&self) -> usize {
         std::mem::size_of_val(self)
-            + self
-                .batches
-                .iter()
-                .map(|b| b.get_array_memory_size())
-                .sum::<usize>()
-            + self
-                .batch_entries
-                .iter()
-                .map(|e| e.capacity() * std::mem::size_of::<(u32, u32)>())
-                .sum::<usize>()
+            + self.batches.memory_size()
+            + self.batch_entries.capacity() * std::mem::size_of::<Vec<Entry>>()
+            + self.entries_bytes
     }
 }
 
@@ -599,14 +537,22 @@ mod test {
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
     use datafusion::prelude::{SessionConfig, SessionContext};
+    use geoarrow_array::GeoArrowArray;
+    use geoarrow_array::array::from_arrow_array;
+    use geoarrow_schema::GeoArrowType;
 
     use super::*;
     use crate::udf::native::accessors::Dump;
-    use crate::udf::native::io::{AsText, GeomFromText};
+    use crate::udf::native::io::{AsBinary, AsText, GeomFromText};
+
+    //
+    // Helpers
+    //
 
     fn register(ctx: &SessionContext) {
         ctx.register_udaf(CollectAggregate::default().into());
         ctx.register_udf(GeomFromText::default().into());
+        ctx.register_udf(AsBinary.into());
         ctx.register_udf(AsText.into());
         ctx.register_udf(Dump::default().into());
     }
@@ -617,8 +563,8 @@ mod test {
         ctx
     }
 
-    /// A context whose plans split aggregation across batches/partitions, exercising the
-    /// partial→merge→final path (`update_batch`/`state`/`merge_batch`/`evaluate`).
+    /// A context whose plans split aggregation across batches/partitions,
+    /// which forces a two-phase aggregation.
     fn ctx_two_phase() -> SessionContext {
         let config = SessionConfig::new()
             .with_batch_size(1)
@@ -628,8 +574,7 @@ mod test {
         ctx
     }
 
-    /// Build a geometry array (and its field) from WKT literals via `ST_GeomFromText`, for driving a
-    /// `CollectGroupsAccumulator` directly. A `NULL` WKT yields a NULL geometry.
+    /// Build a geometry array encoded using arrow-native geometries.
     async fn geom_array(ctx: &SessionContext, wkts: &[Option<&str>]) -> (ArrayRef, FieldRef) {
         let values = wkts
             .iter()
@@ -651,12 +596,35 @@ mod test {
         (array, field)
     }
 
-    /// Render a mixed-`Geometry` output array (as produced by `evaluate`) to per-row WKT, mapping NULL
-    /// rows to the literal `"NULL"`.
-    fn geom_wkts(array: &ArrayRef, metadata: Arc<Metadata>, coord_type: CoordType) -> Vec<String> {
+    /// Build a geometry array encoded as WKB.
+    async fn wkb_array(ctx: &SessionContext, wkts: &[Option<&str>]) -> (ArrayRef, FieldRef) {
+        let values = wkts
+            .iter()
+            .map(|w| match w {
+                Some(w) => format!("('{w}')"),
+                None => "(CAST(NULL AS TEXT))".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let df = ctx
+            .sql(&format!(
+                "SELECT ST_AsBinary(ST_GeomFromText(w)) AS g FROM (VALUES {values}) AS t(w)"
+            ))
+            .await
+            .unwrap();
+        let batch = df.collect().await.unwrap().into_iter().next().unwrap();
+        let array = batch.column_by_name("g").unwrap().clone();
+        let field = Arc::new(batch.schema().field_with_name("g").unwrap().clone());
+        (array, field)
+    }
+
+    /// Render a mixed-`Geometry` output array (as produced by `evaluate`)
+    /// to WKT, mapping NULL rows to the literal `"NULL"`.
+    fn geom_wkts(array: &ArrayRef, input_field: &FieldRef, coord_type: CoordType) -> Vec<String> {
+        let metadata = Arc::new(Metadata::try_from(input_field.as_ref()).unwrap());
         let geom_type = GeometryType::new(metadata).with_coord_type(coord_type);
-        let field = geom_type.to_field("", true);
-        let geo = from_arrow_array(array, &field).unwrap();
+        let output_field = geom_type.to_field("", true);
+        let geo = from_arrow_array(array, &output_field).unwrap();
         let wkt = geoarrow_array::cast::to_wkt::<i32>(geo.as_ref())
             .unwrap()
             .to_array_ref();
@@ -672,12 +640,42 @@ mod test {
             .collect()
     }
 
-    fn collect_meta(field: &FieldRef) -> Arc<Metadata> {
-        Arc::new(Metadata::try_from(field.as_ref()).unwrap_or_default())
+    /// Build a grouped accumulator the same way the aggregate implementation does.
+    ///
+    /// Metadata and state encoding both come from the input field: WKB inputs keep WKB aggregate
+    /// state, while native/WKT inputs use native `Geometry` state. Tests use the default coordinate
+    /// type because that is what `CollectAggregate::default()` registers.
+    fn groups_accumulator_for_field(field: FieldRef) -> CollectGroupsAccumulator {
+        let metadata = Arc::new(Metadata::try_from(field.as_ref()).unwrap());
+        let encoding = StateEncoding::for_field(field.as_ref()).unwrap();
+        CollectGroupsAccumulator::new(field, metadata, CoordType::default(), encoding)
     }
 
-    /// Run `sql` and return the (nullable) first text cell of the first row.
-    async fn text1(ctx: &SessionContext, sql: &str) -> Option<String> {
+    /// Asserts that the input is a GeoArrow Geometry array.
+    fn assert_is_native_geometry(array: &ArrayRef) {
+        let DataType::List(field) = array.data_type() else {
+            panic!("expected List, got {:?}", array.data_type());
+        };
+        assert!(
+            matches!(
+                GeoArrowType::from_arrow_field(field.as_ref()).unwrap(),
+                GeoArrowType::Geometry(_)
+            ),
+            "expected List<Geometry> state, got {:?}",
+            field
+        );
+    }
+
+    /// Asserts that the input is a binary array.
+    fn array_is_binary(array: &ArrayRef) {
+        let DataType::List(field) = array.data_type() else {
+            panic!("expected List, got {:?}", array.data_type());
+        };
+        assert_eq!(field.data_type(), &DataType::Binary);
+    }
+
+    /// Run `sql` in `ctx` and return the (nullable) first column of the first row.
+    async fn exec_single(ctx: &SessionContext, sql: &str) -> Option<String> {
         let df = ctx.sql(sql).await.unwrap();
         let batch = df.collect().await.unwrap().into_iter().next().unwrap();
         let col = batch.column(0).as_string::<i32>();
@@ -691,18 +689,55 @@ mod test {
             .map(|w| format!("('{w}')"))
             .collect::<Vec<_>>()
             .join(",");
-        text1(
+        exec_single(
             ctx,
             &format!(
-                "SELECT ST_AsText(ST_Collect(ST_GeomFromText(w))) FROM (VALUES {values}) AS t(w)"
+                "SELECT ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) FROM (VALUES {values}) AS t(w)"
             ),
         )
         .await
     }
 
-    /// Homogeneous atomic inputs collect into the matching MULTI*.
+    //
+    // Tests
+    //
+
+    #[tokio::test]
+    async fn test_collect_distinct_sql_dedupes_before_udaf() {
+        let ctx = ctx();
+        let out = exec_single(
+            &ctx,
+            "SELECT ST_AsText(ST_CollectAgg(DISTINCT ST_GeomFromText(w))) \
+             FROM (VALUES ('POINT(0 0)'), ('POINT(0 0)'), ('POINT(1 1)')) AS t(w)",
+        )
+        .await;
+        let out = out.unwrap();
+        assert!(out.starts_with("MULTIPOINT"), "{out}");
+        assert_eq!(out.matches('(').count(), 3, "{out}");
+        assert!(out.contains("(0 0)"), "{out}");
+        assert!(out.contains("(1 1)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn test_collect_order_by_not_implemented() {
+        let ctx = ctx();
+        let sql = "SELECT ST_AsText(ST_CollectAgg(ST_GeomFromText(w) ORDER BY k)) \
+                   FROM (VALUES (2, 'POINT(2 2)'), (1, 'POINT(1 1)')) AS t(k,w)";
+        let err = match ctx.sql(sql).await {
+            Ok(df) => df.collect().await.unwrap_err().to_string(),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("not implemented") || err.contains("NotImplemented"),
+            "expected a not-implemented error, got: {err}"
+        );
+        assert!(err.contains("ST_CollectAgg"), "{err}");
+        assert!(err.contains("ORDER BY"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_collect_homogeneous() {
+        // Homogeneous atomic inputs collect into the matching MULTI*.
         let ctx = ctx();
         // PostGIS doc example shape: points -> MultiPoint.
         assert_eq!(
@@ -725,7 +760,6 @@ mod test {
         );
     }
 
-    /// Mixed types (or members that are themselves collections) collect into a GeometryCollection.
     #[tokio::test]
     async fn test_collect_mixed_to_gc() {
         let ctx = ctx();
@@ -737,14 +771,12 @@ mod test {
         );
     }
 
-    /// Mixing coordinate dimensions in a single collection is unrepresentable in geoarrow's
-    /// `Geometry` type, so it surfaces as a clean error rather than panicking the query.
     #[tokio::test]
     async fn test_collect_mixed_dimensions_errors() {
         let ctx = ctx();
         let df = ctx
             .sql(
-                "SELECT ST_AsText(ST_Collect(ST_GeomFromText(w))) \
+                "SELECT ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) \
                  FROM (VALUES ('POINT(0 0)'), ('POINT Z(1 1 1)')) AS t(w)",
             )
             .await
@@ -752,12 +784,10 @@ mod test {
         let err = df.collect().await.unwrap_err();
         assert!(
             err.to_string().contains("dimension"),
-            "expected a dimension error, got: {err}"
+            "expected a dimension error, got: {err}",
         );
     }
 
-    /// An empty member is embedded verbatim (see the MULTIPOINT/MULTIPOLYGON empty-member caveats —
-    /// MULTILINESTRING is the safe vehicle for this). geoarrow renders an empty member as `()`.
     #[tokio::test]
     async fn test_collect_empty_member() {
         let ctx = ctx();
@@ -765,11 +795,10 @@ mod test {
             collect_wkts(&ctx, &["LINESTRING(0 0,1 1)", "LINESTRING EMPTY"])
                 .await
                 .as_deref(),
-            Some("MULTILINESTRING((0 0,1 1),())")
+            Some("MULTILINESTRING((0 0,1 1),())"),
         );
     }
 
-    /// Z is preserved (a GEOS round-trip would strip M; this native path keeps both).
     #[tokio::test]
     async fn test_collect_preserves_z() {
         let ctx = ctx();
@@ -777,38 +806,37 @@ mod test {
             collect_wkts(&ctx, &["POINT Z(1 2 3)", "POINT Z(1 2 4)"])
                 .await
                 .as_deref(),
-            Some("MULTIPOINT Z((1 2 3),(1 2 4))")
+            Some("MULTIPOINT Z((1 2 3),(1 2 4))"),
+            "Z coordinate should be preserved"
         );
     }
 
-    /// NULL inputs are skipped; an all-NULL group yields NULL.
     #[tokio::test]
     async fn test_collect_nulls() {
         let ctx = ctx();
-        let one_null = text1(
+        let one_null = exec_single(
             &ctx,
-            "SELECT ST_AsText(ST_Collect(ST_GeomFromText(w))) \
+            "SELECT ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) \
              FROM (VALUES ('POINT(0 0)'), (CAST(NULL AS TEXT)), ('POINT(1 1)')) AS t(w)",
         )
         .await;
         assert_eq!(one_null.as_deref(), Some("MULTIPOINT((0 0),(1 1))"));
 
-        let all_null = text1(
+        let all_null = exec_single(
             &ctx,
-            "SELECT ST_AsText(ST_Collect(ST_GeomFromText(w))) \
+            "SELECT ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) \
              FROM (VALUES (CAST(NULL AS TEXT))) AS t(w)",
         )
         .await;
         assert_eq!(all_null, None);
     }
 
-    /// Aggregate with GROUP BY — the canonical PostGIS usage shape.
     #[tokio::test]
     async fn test_collect_group_by() {
         let ctx = ctx();
         let df = ctx
             .sql(
-                "SELECT k, ST_AsText(ST_Collect(ST_GeomFromText(w))) AS g \
+                "SELECT k, ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) AS g \
                  FROM (VALUES (1,'POINT(0 0)'),(1,'POINT(1 1)'),(2,'POINT(9 9)')) AS t(k,w) \
                  GROUP BY k ORDER BY k",
             )
@@ -820,7 +848,6 @@ mod test {
         assert_eq!(g.value(1), "MULTIPOINT((9 9))");
     }
 
-    /// Round-trip: `ST_Collect` over the components of `ST_Dump` reconstructs flat multis.
     #[tokio::test]
     async fn test_roundtrip_dump_collect() {
         let ctx = ctx();
@@ -857,7 +884,7 @@ mod test {
                 collect_wkts(&ctx, &parts.iter().map(String::as_str).collect::<Vec<_>>()).await;
             // Compare against the canonical (ST_AsText-normalized) form of the original, since
             // ST_AsText parenthesizes MultiPoint parts.
-            let expected = text1(
+            let expected = exec_single(
                 &ctx,
                 &format!("SELECT ST_AsText(ST_GeomFromText('{orig}'))"),
             )
@@ -866,13 +893,10 @@ mod test {
         }
     }
 
-    /// Collection-member parity with PostGIS 3.6.3 / GEOS 3.13.1: a member that is itself a MULTI*
-    /// (or a different base type) makes ST_Collect return a GEOMETRYCOLLECTION with members embedded
-    /// verbatim — never flattened — exactly as PostGIS does.
-    ///
-    /// Verify by pasting into psql ("postgresql://osm:osm@localhost:5432/osm"), e.g.:
-    ///   SELECT ST_AsText(ST_Collect(ST_GeomFromText(w)))
-    ///   FROM (VALUES ('LINESTRING(0 0,1 1)'),('MULTILINESTRING((2 2,3 3),(4 4,5 5))')) AS t(w);
+    //
+    // Various contrived cases that we verified against PostGIS
+    //
+
     #[tokio::test]
     async fn test_collect_parity_collection_members() {
         let ctx = ctx();
@@ -908,12 +932,6 @@ mod test {
         );
     }
 
-    /// Empty-member parity with PostGIS 3.6.3 / GEOS 3.13.1. geoarrow renders an empty member as
-    /// `()` where PostGIS renders `EMPTY` (PostGIS: `MULTILINESTRING(EMPTY,EMPTY)`) — same geometry,
-    /// different spelling.
-    ///
-    ///   SELECT ST_AsText(ST_Collect(ST_GeomFromText(w)))
-    ///   FROM (VALUES ('LINESTRING EMPTY'),('LINESTRING EMPTY')) AS t(w);
     #[tokio::test]
     async fn test_collect_parity_empty_members() {
         let ctx = ctx();
@@ -933,12 +951,6 @@ mod test {
         );
     }
 
-    /// Higher-dimension parity with PostGIS 3.6.3 / GEOS 3.13.1: Z and M are both preserved.
-    /// geoarrow renders the dimension tag tight (`MULTIPOINT ZM((...))`) where PostGIS spaces or
-    /// elides it (`MULTIPOINT ZM (...)`, `MULTIPOINTM(...)`); the geometry is identical.
-    ///
-    ///   SELECT ST_AsEWKT(ST_Collect(ST_GeomFromText(w)))
-    ///   FROM (VALUES ('POINT ZM(0 0 1 5)'),('POINT ZM(1 1 2 6)')) AS t(w);
     #[tokio::test]
     async fn test_collect_parity_zm_dimensions() {
         let ctx = ctx();
@@ -956,15 +968,16 @@ mod test {
         );
     }
 
-    /// Multi-batch, multi-partition `GROUP BY` forces partial aggregation + merge through the
-    /// `GroupsAccumulator` (`update_batch`/`state`/`merge_batch`/`evaluate`). Member order is not
-    /// guaranteed across partitions, so assert membership rather than exact order.
+    //
+    // Grouping tests
+    //
+
     #[tokio::test]
     async fn test_collect_group_by_two_phase() {
         let ctx = ctx_two_phase();
         let df = ctx
             .sql(
-                "SELECT k, ST_AsText(ST_Collect(ST_GeomFromText(w))) AS g FROM (VALUES \
+                "SELECT k, ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) AS g FROM (VALUES \
                  (1,'POINT(0 0)'),(2,'POINT(5 5)'),(1,'POINT(1 1)'),(2,'POINT(6 6)'),(1,'POINT(2 2)') \
                  ) AS t(k,w) GROUP BY k ORDER BY k",
             )
@@ -995,13 +1008,12 @@ mod test {
         }
     }
 
-    /// One query mixing the three group outcomes: homogeneous → MULTI*, mixed → GC, all-NULL → NULL.
     #[tokio::test]
     async fn test_collect_group_by_heterogeneous() {
         let ctx = ctx();
         let df = ctx
             .sql(
-                "SELECT k, ST_AsText(ST_Collect(ST_GeomFromText(w))) AS g FROM (VALUES \
+                "SELECT k, ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) AS g FROM (VALUES \
                  (1,'POINT(0 0)'),(1,'POINT(1 1)'), \
                  (2,'POINT(2 2)'),(2,'LINESTRING(3 3,4 4)'), \
                  (3,CAST(NULL AS TEXT)) \
@@ -1019,14 +1031,16 @@ mod test {
         assert!(g.is_null(2), "all-NULL group should be NULL");
     }
 
-    /// Ungrouped collect over many small batches/partitions exercises the rewritten simple
-    /// `Accumulator` (`update`/`state`/`merge`/`evaluate`). Order is not guaranteed; assert membership.
+    //
+    // Accumulator edges
+    //
+
     #[tokio::test]
-    async fn test_collect_ungrouped_multibatch() {
+    async fn test_collect_ungrouped_multi_batch() {
         let ctx = ctx_two_phase();
-        let v = text1(
+        let v = exec_single(
             &ctx,
-            "SELECT ST_AsText(ST_Collect(ST_GeomFromText(w))) FROM (VALUES \
+            "SELECT ST_AsText(ST_CollectAgg(ST_GeomFromText(w))) FROM (VALUES \
              ('POINT(0 0)'),('POINT(1 1)'),('POINT(2 2)'),('POINT(3 3)')) AS t(w)",
         )
         .await
@@ -1038,9 +1052,6 @@ mod test {
         }
     }
 
-    /// The high-cardinality fast path: `convert_to_state` turns each row into a one-element list,
-    /// which `merge_batch` then groups. Drives the accumulator directly so the path is covered
-    /// regardless of DataFusion's runtime heuristics.
     #[tokio::test]
     async fn test_groups_accumulator_convert_to_state() {
         let ctx = ctx();
@@ -1049,18 +1060,17 @@ mod test {
             &[Some("POINT(0 0)"), Some("POINT(1 1)"), Some("POINT(2 2)")],
         )
         .await;
-        let meta = collect_meta(&field);
-
-        let acc = CollectGroupsAccumulator::new(field.clone(), meta.clone(), CoordType::default());
+        let acc = groups_accumulator_for_field(field.clone());
         let states = acc.convert_to_state(&[array], None).unwrap();
+        assert_is_native_geometry(&states[0]);
 
         // rows 0 & 2 -> group 0, row 1 -> group 1.
-        let mut merged = CollectGroupsAccumulator::new(field, meta.clone(), CoordType::default());
+        let mut merged = groups_accumulator_for_field(field.clone());
         merged.merge_batch(&states, &[0, 1, 0], None, 2).unwrap();
         let out = merged.evaluate(EmitTo::All).unwrap();
 
         assert_eq!(
-            geom_wkts(&out, meta, CoordType::default()),
+            geom_wkts(&out, &field, CoordType::default()),
             vec![
                 "MULTIPOINT((0 0),(2 2))".to_string(),
                 "MULTIPOINT((1 1))".to_string()
@@ -1068,25 +1078,139 @@ mod test {
         );
     }
 
-    /// `EmitTo::First` emits a prefix of groups and shifts the rest down — the spill path. Exercises
-    /// `compact_retained_state` (drop/compact batches, renumber retained groups).
     #[tokio::test]
-    async fn test_groups_accumulator_emit_first() {
+    async fn test_groups_accumulator_convert_to_state_wkb_encoding() {
+        let ctx = ctx();
+        let (array, field) = wkb_array(
+            &ctx,
+            &[Some("POINT(0 0)"), Some("POINT(1 1)"), Some("POINT(2 2)")],
+        )
+        .await;
+        let acc = groups_accumulator_for_field(field.clone());
+        let states = acc.convert_to_state(&[array], None).unwrap();
+        array_is_binary(&states[0]);
+
+        let mut merged = groups_accumulator_for_field(field.clone());
+        merged.merge_batch(&states, &[0, 1, 0], None, 2).unwrap();
+        let out = merged.evaluate(EmitTo::All).unwrap();
+
+        assert_eq!(
+            geom_wkts(&out, &field, CoordType::default()),
+            vec![
+                "MULTIPOINT((0 0),(2 2))".to_string(),
+                "MULTIPOINT((1 1))".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_groups_accumulator_update_batch_filter() {
+        let ctx = ctx();
+        let (array, field) = geom_array(
+            &ctx,
+            &[
+                Some("POINT(0 0)"),
+                Some("POINT(1 1)"),
+                Some("POINT(2 2)"),
+                Some("POINT(3 3)"),
+            ],
+        )
+        .await;
+        let mut acc = groups_accumulator_for_field(field.clone());
+        let filter = BooleanArray::from(vec![Some(true), Some(false), None, Some(true)]);
+        acc.update_batch(&[array], &[0, 0, 0, 1], Some(&filter), 2)
+            .unwrap();
+
+        let out = acc.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            geom_wkts(&out, &field, CoordType::default()),
+            vec![
+                "MULTIPOINT((0 0))".to_string(),
+                "MULTIPOINT((3 3))".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_groups_accumulator_state_emit_first_then_merge() {
         let ctx = ctx();
         let (array, field) = geom_array(
             &ctx,
             &[Some("POINT(0 0)"), Some("POINT(1 1)"), Some("POINT(2 2)")],
         )
         .await;
-        let meta = collect_meta(&field);
-        let mut acc =
-            CollectGroupsAccumulator::new(field.clone(), meta.clone(), CoordType::default());
+        let mut acc = groups_accumulator_for_field(field.clone());
+        acc.update_batch(&[array], &[0, 1, 2], None, 3).unwrap();
+
+        let first_state = acc.state(EmitTo::First(1)).unwrap();
+        let mut merged_first = groups_accumulator_for_field(field.clone());
+        merged_first
+            .merge_batch(&first_state, &[0], None, 1)
+            .unwrap();
+        let first_out = merged_first.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            geom_wkts(&first_out, &field, CoordType::default()),
+            vec!["MULTIPOINT((0 0))".to_string()]
+        );
+
+        let (array2, _) = geom_array(&ctx, &[Some("POINT(9 9)")]).await;
+        acc.update_batch(&[array2], &[1], None, 2).unwrap();
+        let rest = acc.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            geom_wkts(&rest, &field, CoordType::default()),
+            vec![
+                "MULTIPOINT((1 1))".to_string(),
+                "MULTIPOINT((2 2),(9 9))".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_groups_accumulator_emit_first_wkb_encoding() {
+        let ctx = ctx();
+        let (array, field) = wkb_array(
+            &ctx,
+            &[Some("POINT(0 0)"), Some("POINT(1 1)"), Some("POINT(2 2)")],
+        )
+        .await;
+        let mut acc = groups_accumulator_for_field(field.clone());
+        acc.update_batch(&[array], &[0, 1, 2], None, 3).unwrap();
+
+        let first = acc.evaluate(EmitTo::First(1)).unwrap();
+        assert_eq!(
+            geom_wkts(&first, &field, CoordType::default()),
+            vec!["MULTIPOINT((0 0))".to_string()]
+        );
+
+        let (array2, _) = wkb_array(&ctx, &[Some("POINT(9 9)")]).await;
+        acc.update_batch(&[array2], &[1], None, 2).unwrap();
+        let rest = acc.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            geom_wkts(&rest, &field, CoordType::default()),
+            vec![
+                "MULTIPOINT((1 1))".to_string(),
+                "MULTIPOINT((2 2),(9 9))".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_groups_accumulator_emit_first() {
+        // `EmitTo::First` emits a prefix of groups and shifts the rest down, exercising retained-row
+        // compaction and group renumbering.
+        let ctx = ctx();
+        let (array, field) = geom_array(
+            &ctx,
+            &[Some("POINT(0 0)"), Some("POINT(1 1)"), Some("POINT(2 2)")],
+        )
+        .await;
+        let mut acc = groups_accumulator_for_field(field.clone());
         acc.update_batch(&[array], &[0, 1, 2], None, 3).unwrap();
 
         // Emit group 0 only; groups 1,2 shift down to 0,1.
         let first = acc.evaluate(EmitTo::First(1)).unwrap();
         assert_eq!(
-            geom_wkts(&first, meta.clone(), CoordType::default()),
+            geom_wkts(&first, &field, CoordType::default()),
             vec!["MULTIPOINT((0 0))".to_string()]
         );
 
@@ -1095,7 +1219,7 @@ mod test {
         acc.update_batch(&[array2], &[1], None, 2).unwrap();
         let rest = acc.evaluate(EmitTo::All).unwrap();
         assert_eq!(
-            geom_wkts(&rest, meta, CoordType::default()),
+            geom_wkts(&rest, &field, CoordType::default()),
             vec![
                 "MULTIPOINT((1 1))".to_string(),
                 "MULTIPOINT((2 2),(9 9))".to_string()
@@ -1103,26 +1227,86 @@ mod test {
         );
     }
 
-    /// NULL and filtered-out rows are dropped by `convert_to_state` (NULL lists), so they never reach
-    /// a group; an all-NULL group emits NULL.
+    #[tokio::test]
+    async fn test_groups_accumulator_emit_first_shrinks_footprint() {
+        // `EmitTo::First` must shrink the incrementally-tracked footprint as members drain.
+        // One batch straddles the emit cutoff, exercising the `Replace`/`take` compaction path:
+        // group 0 (the large emitted prefix) is dropped, group 1 (one member) is retained.
+        let ctx = ctx();
+        let mut wkts: Vec<Option<&str>> = vec![Some("POINT(0 0)"); 100];
+        wkts.push(Some("POINT(9 9)"));
+        let (array, field) = geom_array(&ctx, &wkts).await;
+        let mut groups: Vec<usize> = vec![0; 100];
+        groups.push(1);
+        let mut acc = groups_accumulator_for_field(field.clone());
+        acc.update_batch(&[array], &groups, None, 2).unwrap();
+
+        let before = acc.size();
+        acc.evaluate(EmitTo::First(1)).unwrap();
+        let after = acc.size();
+        assert!(
+            after < before,
+            "footprint should shrink after EmitTo::First drops a group: {before} -> {after}"
+        );
+
+        // The retained group (1 -> 0) still assembles correctly from the compacted batch.
+        let rest = acc.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            geom_wkts(&rest, &field, CoordType::default()),
+            vec!["MULTIPOINT((9 9))".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn test_groups_accumulator_convert_to_state_nulls() {
         let ctx = ctx();
         let (array, field) =
             geom_array(&ctx, &[Some("POINT(0 0)"), None, Some("POINT(2 2)")]).await;
-        let meta = collect_meta(&field);
-
-        let acc = CollectGroupsAccumulator::new(field.clone(), meta.clone(), CoordType::default());
+        let acc = groups_accumulator_for_field(field.clone());
         let states = acc.convert_to_state(&[array], None).unwrap();
+        assert_is_native_geometry(&states[0]);
 
         // row 0 -> group 0, NULL row 1 -> group 1 (stays empty -> NULL), row 2 -> group 0.
-        let mut merged = CollectGroupsAccumulator::new(field, meta.clone(), CoordType::default());
+        let mut merged = groups_accumulator_for_field(field.clone());
         merged.merge_batch(&states, &[0, 1, 0], None, 2).unwrap();
         let out = merged.evaluate(EmitTo::All).unwrap();
 
+        // NULL and filtered-out rows are dropped by `convert_to_state` (NULL lists), so they never reach
+        // a group; an all-NULL group emits NULL.
         assert_eq!(
-            geom_wkts(&out, meta, CoordType::default()),
+            geom_wkts(&out, &field, CoordType::default()),
             vec!["MULTIPOINT((0 0),(2 2))".to_string(), "NULL".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_groups_accumulator_convert_to_state_filter_and_nulls() {
+        let ctx = ctx();
+        let (array, field) = geom_array(
+            &ctx,
+            &[
+                Some("POINT(0 0)"),
+                None,
+                Some("POINT(2 2)"),
+                Some("POINT(3 3)"),
+            ],
+        )
+        .await;
+        let acc = groups_accumulator_for_field(field.clone());
+        let filter = BooleanArray::from(vec![Some(true), Some(true), Some(false), Some(true)]);
+        let states = acc.convert_to_state(&[array], Some(&filter)).unwrap();
+        assert_is_native_geometry(&states[0]);
+
+        let mut merged = groups_accumulator_for_field(field.clone());
+        merged.merge_batch(&states, &[0, 1, 0, 1], None, 2).unwrap();
+        let out = merged.evaluate(EmitTo::All).unwrap();
+
+        assert_eq!(
+            geom_wkts(&out, &field, CoordType::default()),
+            vec![
+                "MULTIPOINT((0 0))".to_string(),
+                "MULTIPOINT((3 3))".to_string()
+            ]
         );
     }
 }

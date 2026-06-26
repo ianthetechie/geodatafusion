@@ -29,17 +29,18 @@ datafusion-datasource = { version = "53", default-features = false }
 datafusion-datasource-parquet = "53"
 flatgeobuf = { version = "5.0", default-features = false }
 futures = "0.3"
-geo = "0.31.0"
+geo = "0.33.0"
 geo-traits = "0.3.0"
-geoarrow-array = "0.8.0"
-geoarrow-flatgeobuf = "0.8.0"
-geoarrow-expr-geo = "0.8.0"
-geoarrow-geojson = "0.8.0"
-geoarrow-schema = "0.8.0"
+geoarrow-array = { git = "https://github.com/ianthetechie/geoarrow-rs.git", branch = "to-geos-impl" }
+geoarrow-flatgeobuf = { git = "https://github.com/ianthetechie/geoarrow-rs.git", branch = "to-geos-impl" }
+geoarrow-expr-geo = { git = "https://github.com/ianthetechie/geoarrow-rs.git", branch = "to-geos-impl" }
+geoarrow-expr-geos = { git = "https://github.com/ianthetechie/geoarrow-rs.git", branch = "to-geos-impl" }
+geoarrow-geojson = { git = "https://github.com/ianthetechie/geoarrow-rs.git", branch = "to-geos-impl" }
+geoarrow-schema = { git = "https://github.com/ianthetechie/geoarrow-rs.git", branch = "to-geos-impl" }
 geodatafusion = { path = "rust/geodatafusion", version = "0.4.0" }
 geohash = "0.13.1"
 geojson = "0.24"
-geoparquet = "0.8.0"
+geoparquet = { git = "https://github.com/ianthetechie/geoarrow-rs.git", branch = "to-geos-impl" }
 geos = { version = "11.1", default-features = false }
 http-range-client = { version = "0.9", default-features = false }
 object_store = "0.13.2"
