@@ -16,7 +16,11 @@ rust-version = { workspace = true }
 # and the structure should be recursive
 # (with higher version targets implying lower version ones
 # in a chain.)
-geos-3_11 = ["geos/v3_11_0"]
+geos-3_11 = ["geos/v3_11_0", "dep:geoarrow-expr-geos"]
+# GEOS 3.14 gained M-coordinate support, so geometries carrying an M dimension can
+# round-trip through GEOS (where operations like ST_LineMerge still drop M, matching
+# PostGIS). Without this, M-bearing inputs error during the GEOS conversion.
+geos-3_14 = ["geos-3_11", "geos/v3_14_0", "geoarrow-expr-geos/geos-3_14"]
 
 [dependencies]
 arrow-arith = { workspace = true }
@@ -28,6 +32,7 @@ geo = { workspace = true }
 geo-traits = { workspace = true }
 geoarrow-array = { workspace = true }
 geoarrow-expr-geo = { workspace = true }
+geoarrow-expr-geos = { workspace = true, optional = true }
 geoarrow-schema = { workspace = true }
 geohash = { workspace = true }
 geos = { workspace = true, optional = true }
