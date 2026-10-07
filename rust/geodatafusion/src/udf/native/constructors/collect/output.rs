@@ -101,7 +101,6 @@ fn build_geometry_array(
     Ok(out.to_array_ref())
 }
 
-
 const WKB_NDR: u8 = 1;
 
 // ISO-WKB type codes are `base + dimension_offset`; matching dimensions must share the same offset.

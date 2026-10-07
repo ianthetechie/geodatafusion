@@ -288,7 +288,7 @@ Functions are explicitly modeled after the [PostGIS API](https://postgis.net/doc
 | Name                        | Implemented | Description                                                                                       |
 | --------------------------- | ----------- | ------------------------------------------------------------------------------------------------- |
 | ST_Buffer                   |             | Computes a geometry covering all points within a given distance from a geometry.                  |
-| ST_BuildArea                |             | Creates a polygonal geometry formed by the linework of a geometry.                                |
+| ST_BuildArea                | ✅           | Creates a polygonal geometry formed by the linework of a geometry.                                |
 | ST_Centroid                 | ✅          | Returns the geometric center of a geometry.                                                       |
 | ST_ChaikinSmoothing         |             | Returns a smoothed version of a geometry, using the Chaikin algorithm                             |
 | ST_ConcaveHull              | ✅          | Computes a possibly concave geometry that contains all input geometry vertices                    |
