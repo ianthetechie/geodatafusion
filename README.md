@@ -280,7 +280,7 @@ Functions are explicitly modeled after the [PostGIS API](https://postgis.net/doc
 | ST_Split         |             | Returns a collection of geometries created by splitting a geometry by another geometry.     |
 | ST_Subdivide     |             | Computes a rectilinear subdivision of a geometry.                                           |
 | ST_SymDifference |             | Computes a geometry representing the portions of geometries A and B that do not intersect.  |
-| ST_UnaryUnion    |             | Computes the union of the components of a single geometry.                                  |
+| ST_UnaryUnion    | ✅           | Computes the union of the components of a single geometry.                                  |
 | ST_Union         |             | Computes a geometry representing the point-set union of the input geometries.               |
 
 ### Geometry Processing
