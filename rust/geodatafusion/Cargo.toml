@@ -37,6 +37,7 @@ geoarrow-schema = { workspace = true }
 geohash = { workspace = true }
 geos = { workspace = true, optional = true }
 thiserror = { workspace = true }
+wkb = { workspace = true }
 wkt = { workspace = true }
 
 [dev-dependencies]

@@ -456,11 +456,9 @@ fn normalize_geometry_input(
 /// Normalize WKB-like inputs to the i32-offset WKB representation used in state.
 ///
 /// Member bytes are kept verbatim (geoarrow does not re-encode WKB on read).
-/// This path assumes ISO little-endian WKB.
-/// Externally-supplied EWKB or big-endian `geoarrow.wkb` columns are be rejected at
-/// output assembly (see `iso_member_type_code` in `output.rs`)
-/// because the container we build relies on the upstream `wkb` reader's fixed-stride MULTI* decoding,
-/// which cannot read heterogeneously-encoded members.
+/// ISO WKB and EWKB Z/M dimensions are supported in either byte order.
+/// Embedded SRIDs are rejected during output assembly (see `read_wkb_member` in `output/wkb_assembly.rs`),
+/// since the result uses array-level CRS metadata.
 fn normalize_wkb_input(
     values: &ArrayRef,
     input_field: &FieldRef,

@@ -1755,6 +1755,7 @@ dependencies = [
  "object_store",
  "thiserror 1.0.69",
  "tokio",
+ "wkb",
  "wkt 0.14.0",
 ]
 

@@ -893,6 +893,79 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn wkb_output_matches_native_for_collections_and_coordinate_layouts() {
+        // This test verifies that WKB-backed state must produce the same geometry as native state,
+        // regardless of whether output coordinates are interleaved (XYZXYZ) or separated (XX, YY, ZZ).
+        let cases: &[&[&str]] = &[
+            // Atomic types promote to their MULTI* counterparts.
+            &["POINT(0 0)", "POINT(1 2)"],
+            &["LINESTRING(0 0,1 1)", "LINESTRING(1 1,2 3)"],
+            &["POLYGON((0 0,1 0,0 1,0 0))", "POLYGON((2 2,3 2,2 3,2 2))"],
+            // Mixed types and existing MULTI* members produce GeometryCollections.
+            &["POLYGON EMPTY", "LINESTRING(0 0,1 1)"],
+            &["POINT(0 0)", "LINESTRING(0 0,1 1)"],
+            &["MULTILINESTRING((0 0,1 1))", "MULTILINESTRING((2 2,3 3))"],
+            // Empty geometries remain members; they are not treated as NULLs.
+            &["LINESTRING EMPTY", "LINESTRING EMPTY"],
+            // Z and M ordinates must survive both storage paths and output layouts.
+            &["POINT Z(0 0 1)", "POINT Z(2 3 4)"],
+            &["POINT M(0 0 1)", "POINT M(2 3 4)"],
+            &["POINT ZM(0 0 1 2)", "POINT ZM(3 4 5 6)"],
+        ];
+        for coord_type in [CoordType::Interleaved, CoordType::Separated] {
+            let ctx = ctx();
+            ctx.register_udaf(CollectAggregate::new(coord_type).into());
+            for wkts in cases {
+                let expected = collect_wkts(&ctx, wkts).await;
+                // ST_AsBinary forces WKB state; the reference above uses native Geometry state.
+                let values = wkts
+                    .iter()
+                    .map(|w| format!("('{w}')"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT ST_AsText(ST_CollectAgg(ST_AsBinary(ST_GeomFromText(w)))) \
+                     FROM (VALUES {values}) AS t(w)"
+                );
+                assert_eq!(
+                    exec_single(&ctx, &sql).await,
+                    expected,
+                    "WKB/native output mismatch for {coord_type:?}: {wkts:?}"
+                );
+            }
+            // All-NULL input produces NULL, unlike a group containing empty geometries.
+            assert_eq!(
+                exec_single(
+                    &ctx,
+                    "SELECT ST_AsText(ST_CollectAgg(ST_AsBinary(ST_GeomFromText(w)))) \
+                     FROM (VALUES (CAST(NULL AS VARCHAR)), (NULL)) AS t(w)"
+                )
+                .await,
+                None,
+                "all-NULL WKB members must yield NULL with {coord_type:?} output"
+            );
+
+            // Different dimensions must be rejected, rather than dropping or inventing ordinates.
+            let error = ctx
+                .sql(
+                    "SELECT ST_CollectAgg(ST_AsBinary(ST_GeomFromText(w))) \
+                 FROM (VALUES ('POINT(0 0)'), ('POINT Z(1 2 3)')) AS t(w)",
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("differing coordinate dimensions"),
+                "mixed XY/XYZ WKB must fail for {coord_type:?} output: {error}"
+            );
+        }
+    }
+
     //
     // Various contrived cases that we verified against PostGIS
     //

@@ -9,7 +9,8 @@ use geo_traits::{
     MultiPointTrait, MultiPolygonTrait, UnimplementedLine, UnimplementedLineString,
     UnimplementedPoint, UnimplementedPolygon, UnimplementedRect, UnimplementedTriangle,
 };
-use geoarrow_array::scalar::{Geometry, LineString, Point, Polygon};
+use geoarrow_array::scalar::Geometry;
+use wkb::reader::Wkb;
 
 use crate::error::{GeoDataFusionError, GeoDataFusionResult};
 
@@ -22,20 +23,20 @@ pub(super) enum CollectedKind {
 }
 
 /// Borrowed view over one collected output geometry.
-pub(super) struct CollectedGeometry<'a> {
-    members: &'a [Geometry<'a>],
+pub(super) struct CollectedGeometry<'a, M: CollectedMember> {
+    members: &'a [M],
     kind: CollectedKind,
     dim: Dimensions,
 }
 
-impl<'a> CollectedGeometry<'a> {
-    pub(super) fn new(members: &'a [Geometry<'a>], kind: CollectedKind, dim: Dimensions) -> Self {
+impl<'a, M: CollectedMember> CollectedGeometry<'a, M> {
+    pub(super) fn new(members: &'a [M], kind: CollectedKind, dim: Dimensions) -> Self {
         debug_assert!(!members.is_empty());
         Self { members, kind, dim }
     }
 }
 
-impl GeometryTrait for CollectedGeometry<'_> {
+impl<M: CollectedMember> GeometryTrait for CollectedGeometry<'_, M> {
     type T = f64;
     type PointType<'b>
         = UnimplementedPoint<f64>
@@ -50,19 +51,19 @@ impl GeometryTrait for CollectedGeometry<'_> {
     where
         Self: 'b;
     type MultiPointType<'b>
-        = CollectedGeometry<'b>
+        = CollectedGeometry<'b, M>
     where
         Self: 'b;
     type MultiLineStringType<'b>
-        = CollectedGeometry<'b>
+        = CollectedGeometry<'b, M>
     where
         Self: 'b;
     type MultiPolygonType<'b>
-        = CollectedGeometry<'b>
+        = CollectedGeometry<'b, M>
     where
         Self: 'b;
     type GeometryCollectionType<'b>
-        = CollectedGeometry<'b>
+        = CollectedGeometry<'b, M>
     where
         Self: 'b;
     type RectType<'b>
@@ -106,9 +107,9 @@ impl GeometryTrait for CollectedGeometry<'_> {
     }
 }
 
-impl GeometryCollectionTrait for CollectedGeometry<'_> {
+impl<M: CollectedMember> GeometryCollectionTrait for CollectedGeometry<'_, M> {
     type GeometryType<'b>
-        = &'b Geometry<'b>
+        = M::GeometryView<'b>
     where
         Self: 'b;
 
@@ -117,13 +118,13 @@ impl GeometryCollectionTrait for CollectedGeometry<'_> {
     }
 
     unsafe fn geometry_unchecked(&self, i: usize) -> Self::GeometryType<'_> {
-        unsafe { self.members.get_unchecked(i) }
+        unsafe { self.members.get_unchecked(i) }.collected_geometry()
     }
 }
 
-impl MultiPointTrait for CollectedGeometry<'_> {
+impl<M: CollectedMember> MultiPointTrait for CollectedGeometry<'_, M> {
     type InnerPointType<'b>
-        = Point<'b>
+        = M::PointType<'b>
     where
         Self: 'b;
 
@@ -132,17 +133,13 @@ impl MultiPointTrait for CollectedGeometry<'_> {
     }
 
     unsafe fn point_unchecked(&self, i: usize) -> Self::InnerPointType<'_> {
-        match unsafe { self.members.get_unchecked(i) }.as_type() {
-            GeometryType::Point(p) => p.clone(),
-            // Valid because `classify_members` selected the multi-point container.
-            _ => unreachable!("ST_Collect MultiPoint member was not a Point"),
-        }
+        unsafe { self.members.get_unchecked(i) }.collected_point()
     }
 }
 
-impl MultiLineStringTrait for CollectedGeometry<'_> {
+impl<M: CollectedMember> MultiLineStringTrait for CollectedGeometry<'_, M> {
     type InnerLineStringType<'b>
-        = LineString<'b>
+        = M::LineStringType<'b>
     where
         Self: 'b;
 
@@ -151,17 +148,13 @@ impl MultiLineStringTrait for CollectedGeometry<'_> {
     }
 
     unsafe fn line_string_unchecked(&self, i: usize) -> Self::InnerLineStringType<'_> {
-        match unsafe { self.members.get_unchecked(i) }.as_type() {
-            GeometryType::LineString(ls) => ls.clone(),
-            // Valid because `classify_members` selected the multi-line container.
-            _ => unreachable!("ST_Collect MultiLineString member was not a LineString"),
-        }
+        unsafe { self.members.get_unchecked(i) }.collected_line_string()
     }
 }
 
-impl MultiPolygonTrait for CollectedGeometry<'_> {
+impl<M: CollectedMember> MultiPolygonTrait for CollectedGeometry<'_, M> {
     type InnerPolygonType<'b>
-        = Polygon<'b>
+        = M::PolygonType<'b>
     where
         Self: 'b;
 
@@ -170,13 +163,63 @@ impl MultiPolygonTrait for CollectedGeometry<'_> {
     }
 
     unsafe fn polygon_unchecked(&self, i: usize) -> Self::InnerPolygonType<'_> {
-        match unsafe { self.members.get_unchecked(i) }.as_type() {
-            GeometryType::Polygon(p) => p.clone(),
-            // Valid because `classify_members` selected the multi-polygon container.
-            _ => unreachable!("ST_Collect MultiPolygon member was not a Polygon"),
-        }
+        unsafe { self.members.get_unchecked(i) }.collected_polygon()
     }
 }
+
+/// Clone scalar views without imposing higher-ranked bounds on their borrowed associated types.
+pub(super) trait CollectedMember: GeometryTrait<T = f64> {
+    type GeometryView<'a>: GeometryTrait<T = f64>
+    where
+        Self: 'a;
+
+    fn collected_geometry(&self) -> Self::GeometryView<'_>;
+    fn collected_point(&self) -> Self::PointType<'_>;
+    fn collected_line_string(&self) -> Self::LineStringType<'_>;
+    fn collected_polygon(&self) -> Self::PolygonType<'_>;
+}
+
+macro_rules! impl_collected_member {
+    ($member:ident) => {
+        impl CollectedMember for $member<'_> {
+            type GeometryView<'a>
+                = &'a $member<'a>
+            where
+                Self: 'a;
+
+            fn collected_geometry(&self) -> Self::GeometryView<'_> {
+                self
+            }
+
+            fn collected_point(&self) -> Self::PointType<'_> {
+                match self.as_type() {
+                    GeometryType::Point(point) => point.clone(),
+                    // Valid because `classify_members` selected the multi-point container.
+                    _ => unreachable!("ST_Collect MultiPoint member was not a Point"),
+                }
+            }
+
+            fn collected_line_string(&self) -> Self::LineStringType<'_> {
+                match self.as_type() {
+                    GeometryType::LineString(line) => line.clone(),
+                    // Valid because `classify_members` selected the multi-line container.
+                    _ => unreachable!("ST_Collect MultiLineString member was not a LineString"),
+                }
+            }
+
+            fn collected_polygon(&self) -> Self::PolygonType<'_> {
+                match self.as_type() {
+                    GeometryType::Polygon(polygon) => polygon.clone(),
+                    // Valid because `classify_members` selected the multi-polygon container.
+                    _ => unreachable!("ST_Collect MultiPolygon member was not a Polygon"),
+                }
+            }
+        }
+    };
+}
+
+impl_collected_member!(Geometry);
+impl_collected_member!(Wkb);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtomicBase {
