@@ -179,7 +179,7 @@ mod test {
         ctx.register_udf(GeomFromText::default().into());
         ctx.register_udf(GeomFromWKB::new(Default::default()).into());
         ctx.register_udf(AsText.into());
-        // Registered for the ST_LineMerge(ST_Collect(...)) composition parity test.
+        // Registered for the ST_LineMerge(ST_CollectAgg(...)) composition parity test.
         ctx.register_udaf(CollectAggregate::default().into());
         ctx
     }
@@ -401,7 +401,7 @@ mod test {
         assert_eq!(val, "MULTILINESTRING EMPTY");
     }
 
-    /// `ST_LineMerge(ST_Collect(...))` parity with PostGIS 3.6.3 / GEOS 3.13.1 — collect the rows of
+    /// `ST_LineMerge(ST_CollectAgg(...))` parity with PostGIS 3.6.3 / GEOS 3.13.1 — collect the rows of
     /// a VALUES list, then merge the resulting (Multi)LineString / GeometryCollection.
     ///
     /// Verify any row by pasting into psql ("postgresql://osm:osm@localhost:5432/osm"), e.g.:

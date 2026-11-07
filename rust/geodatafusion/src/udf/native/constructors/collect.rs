@@ -27,7 +27,7 @@ use state::{
 use crate::data_types::any_single_geometry_type_input;
 use crate::error::GeoDataFusionResult;
 
-/// `ST_Collect` aggregate: collects a set of geometries into one MULTI*/GEOMETRYCOLLECTION.
+/// `ST_CollectAgg` aggregate: collects a set of geometries into one MULTI*/GEOMETRYCOLLECTION.
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct CollectAggregate {
     coord_type: CoordType,
@@ -170,7 +170,7 @@ impl AggregateUDFImpl for CollectAggregate {
                  NULL inputs are skipped; an all-NULL or empty group yields NULL.
                  Z and M are preserved, but all inputs must be of the same coordinate dimension
                  (mixing e.g. XY and XYZ is an error).",
-                "ST_Collect_Agg(geom)",
+                "ST_CollectAgg(geom)",
             )
             .with_argument("geom", "geometry")
             .build()
@@ -383,7 +383,7 @@ impl GroupsAccumulator for CollectGroupsAccumulator {
             {
                 continue;
             }
-            // NULL geometries contribute nothing (matches ST_Collect semantics).
+            // NULL geometries contribute nothing (matches PostGIS ST_Collect semantics).
             if batch.is_null(row) {
                 continue;
             }

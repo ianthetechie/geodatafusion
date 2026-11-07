@@ -1,4 +1,4 @@
-//! Assemble `ST_Collect` results as a GeoArrow [`GeometryArray`][geoarrow_array::array::GeometryArray].
+//! Assemble `ST_CollectAgg` results as a GeoArrow [`GeometryArray`][geoarrow_array::array::GeometryArray].
 
 use std::sync::Arc;
 
@@ -109,7 +109,7 @@ impl<'a, 'g> PreparedWkbOutput<'a, 'g> {
             }
         }
 
-        // ST_Collect emits only MULTI* or GeometryCollection, even for a single atomic member.
+        // ST_CollectAgg emits only MULTI* or GeometryCollection, even for a single atomic member.
         // The top-level Point, LineString, and Polygon child arrays therefore need no capacity.
         // Atomic members inside collections are counted by GeometryCollectionCapacity itself.
         // If collection classification ever emits atomic results, their capacities must be added here.
@@ -181,12 +181,15 @@ fn read_wkb_member(bytes: &[u8]) -> GeoDataFusionResult<Wkb<'_>> {
         [WKB_NDR, a, b, c, d, ..] => u32::from_le_bytes([*a, *b, *c, *d]),
         // All other prefixes are malformed, regardless of the geometry type.
         _ => {
-            return Err(DataFusionError::Execution("Invalid ST_Collect WKB header".into()).into());
+            return Err(
+                DataFusionError::Execution("Invalid ST_CollectAgg WKB header".into()).into(),
+            );
         }
     };
     if code & EWKB_SRID_MASK != 0 {
         return Err(DataFusionError::NotImplemented(
-            "ST_Collect does not support embedded WKB SRIDs; use array-level CRS metadata".into(),
+            "ST_CollectAgg does not support embedded WKB SRIDs; use array-level CRS metadata"
+                .into(),
         )
         .into());
     }
