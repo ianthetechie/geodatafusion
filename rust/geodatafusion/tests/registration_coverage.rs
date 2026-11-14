@@ -4,6 +4,22 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 
 const IMPLEMENTED: &str = "\u{2705}";
+
+// These registered SQL names implement PostGIS behavior under distinct names.
+// The compatibility matrix is reserved for canonical PostGIS names.
+const NON_POSTGIS_FUNCTIONS: [&str; 2] = ["st_collect_agg", "st_collectagg"];
+
+fn postgis_compatibility_functions() -> BTreeSet<String> {
+    include_str!("../../../POSTGIS_COMPATIBILITY.md")
+        .lines()
+        .filter_map(|line| {
+            let row = line.strip_prefix('|')?;
+            let name = row.split('|').next()?.trim();
+            name.starts_with("ST_").then(|| name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
 fn postgis_compatibility_implemented_functions() -> BTreeSet<String> {
     include_str!("../../../POSTGIS_COMPATIBILITY.md")
         .lines()
@@ -54,6 +70,16 @@ fn registered_functions() -> BTreeSet<String> {
 
 #[test]
 fn readme_implemented_functions_match_public_registration() {
+    let registered = registered_functions();
+    let postgis_functions = postgis_compatibility_functions();
+    for name in NON_POSTGIS_FUNCTIONS {
+        assert!(registered.contains(name), "`{name}` must be registered");
+        assert!(
+            !postgis_functions.contains(name),
+            "POSTGIS_COMPATIBILITY.md must only list canonical PostGIS function names: `{name}`"
+        );
+    }
+
     for (doc_name, expected) in [
         (
             "POSTGIS_COMPATIBILITY.md",
@@ -61,7 +87,15 @@ fn readme_implemented_functions_match_public_registration() {
         ),
         ("README.md", readme_supported_functions()),
     ] {
-        let actual = registered_functions();
+        let actual = if doc_name == "POSTGIS_COMPATIBILITY.md" {
+            registered
+                .iter()
+                .filter(|name| !NON_POSTGIS_FUNCTIONS.contains(&name.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            registered.clone()
+        };
         let missing_from_registry = expected.difference(&actual).collect::<Vec<_>>();
         let missing_from_doc = actual.difference(&expected).collect::<Vec<_>>();
 
