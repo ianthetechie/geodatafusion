@@ -824,8 +824,8 @@ mod test {
                 .await
                 .as_deref(),
             &[
-                Some("MULTILINESTRING((0 0,1 1),())"),
-                Some("MULTILINESTRING((),(0 0,1 1))"),
+                Some("MULTILINESTRING((0 0,1 1),EMPTY)"),
+                Some("MULTILINESTRING(EMPTY,(0 0,1 1))"),
             ],
         );
     }
@@ -1002,7 +1002,7 @@ mod test {
             ),
             (
                 &["LINESTRING EMPTY", "LINESTRING EMPTY"],
-                &["MULTILINESTRING((),())"],
+                &["MULTILINESTRING(EMPTY,EMPTY)"],
             ),
             (
                 &["POINT Z(0 0 1)", "POINT Z(2 3 4)"],
@@ -1137,7 +1137,7 @@ mod test {
             collect_wkts(&ctx, &["LINESTRING EMPTY", "LINESTRING EMPTY"])
                 .await
                 .as_deref(),
-            Some("MULTILINESTRING((),())"), // PostGIS: MULTILINESTRING(EMPTY,EMPTY)
+            Some("MULTILINESTRING(EMPTY,EMPTY)"),
         );
         // Mixed bases (empty polygon + line) -> GC, the empty preserved.
         assert_one_of(

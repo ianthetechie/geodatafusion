@@ -48,4 +48,4 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.9", default-features = false }
 wkb = "0.9"
-wkt = "0.14"
+wkt = "0.15"

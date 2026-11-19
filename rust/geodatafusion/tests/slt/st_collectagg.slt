@@ -42,3 +42,18 @@ SELECT ST_AsText(ST_CollectAgg(ST_AsBinary(ST_GeomFromText(w)))) IN (
 FROM (VALUES ('POINT ZM(0 0 1 2)'), ('POINT ZM(3 4 5 6)')) AS t(w);
 ----
 true
+
+query B
+SELECT ST_AsText(ST_Collect_Agg(ST_GeomFromText(w))) IN (
+  'MULTIPOINT((1 2),EMPTY)',
+  'MULTIPOINT(EMPTY,(1 2))'
+)
+FROM (VALUES ('POINT(1 2)'), ('POINT EMPTY')) AS t(w);
+----
+true
+
+query T
+SELECT ST_AsText(ST_Collect_Agg(ST_GeomFromText(w)))
+FROM (VALUES ('POINT EMPTY'), ('POINT EMPTY')) AS t(w);
+----
+MULTIPOINT(EMPTY,EMPTY)

@@ -20,7 +20,7 @@ use geoarrow_array::cast::{AsGeoArrowArray, to_wkb, to_wkt};
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::error::{GeoArrowError, GeoArrowResult};
 use geoarrow_schema::type_id::GeometryTypeId;
-use geoarrow_schema::{Dimension, GeometryCollectionType, GeometryType};
+use geoarrow_schema::{Dimension, GeoArrowType, GeometryCollectionType, GeometryType};
 use wkt::Wkt;
 use wkt::types::{
     Coord, Dimension as WktDimension, GeometryCollection, LineString, MultiLineString, MultiPoint,
@@ -791,7 +791,26 @@ pub(crate) fn array_to_wkt(
 ) -> GeoArrowResult<WktArray> {
     let has_polyhedral = has_encoded_polyhedral_surfaces(geo_array, field);
     let has_nested_gc = has_encoded_nested_collections(geo_array)?;
-    let wkt_arr = to_wkt::<i32>(geo_array)?;
+    // This is TEMPORARY extra complexity pending https://github.com/geoarrow/geoarrow-rs/pull/1482.
+    // GeoArrow 0.9 uses wkt 0.14, whose MultiPoint writer panics on empty members.
+    // This workaround uses our wkt 0.15 writer for arrays that can contain MultiPoints in te interim.
+    let wkt_arr = match geo_array.data_type() {
+        GeoArrowType::MultiPoint(_) => to_wkt_array(geo_array.as_multi_point())?,
+        GeoArrowType::Geometry(_) => to_wkt_array(geo_array.as_geometry())?,
+        GeoArrowType::GeometryCollection(_) => to_wkt_array(geo_array.as_geometry_collection())?,
+        GeoArrowType::Wkb(_) => to_wkt_array(geo_array.as_wkb::<i32>())?,
+        GeoArrowType::LargeWkb(_) => to_wkt_array(geo_array.as_wkb::<i64>())?,
+        GeoArrowType::WkbView(_) => to_wkt_array(geo_array.as_wkb_view())?,
+        GeoArrowType::Point(_)
+        | GeoArrowType::LineString(_)
+        | GeoArrowType::Polygon(_)
+        | GeoArrowType::MultiLineString(_)
+        | GeoArrowType::MultiPolygon(_)
+        | GeoArrowType::Rect(_)
+        | GeoArrowType::Wkt(_)
+        | GeoArrowType::LargeWkt(_)
+        | GeoArrowType::WktView(_) => to_wkt::<i32>(geo_array)?,
+    };
     if !has_polyhedral && !has_nested_gc {
         return Ok(wkt_arr);
     }
@@ -814,6 +833,25 @@ pub(crate) fn array_to_wkt(
         }
     }
     Ok(WktArray::new(builder.finish(), metadata))
+}
+
+// This is TEMPORARY pending https://github.com/geoarrow/geoarrow-rs/pull/1482.
+fn to_wkt_array<'a>(array: &'a impl GeoArrowArrayAccessor<'a>) -> GeoArrowResult<WktArray> {
+    let mut builder = StringBuilder::with_capacity(array.len(), 0);
+    for geometry in array.iter() {
+        let Some(geometry) = geometry else {
+            builder.append_null();
+            continue;
+        };
+        let geometry = geometry?;
+        wkt::to_wkt::write_geometry(&mut builder, &geometry)
+            .map_err(|err| GeoArrowError::External(Box::new(err)))?;
+        builder.append_value("");
+    }
+    Ok(WktArray::new(
+        builder.finish(),
+        array.data_type().metadata().clone(),
+    ))
 }
 
 pub(crate) fn array_to_wkb(
